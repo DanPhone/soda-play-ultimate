@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Evolution Creatures</title>
+  <style>
+    :root {
+      --bg: #0f111a;
+      --panel: rgba(22, 24, 36, 0.9);
+      --text: #e8ebff;
+      --muted: #9da7d1;
+      --accent: #6ee7ff;
+    }
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, Segoe UI, Roboto, Arial, sans-serif;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+    .hud {
+      position: fixed;
+      left: 12px;
+      top: 12px;
+      background: var(--panel);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 10px;
+      padding: 10px 12px;
+      line-height: 1.35;
+      font-size: 13px;
+      pointer-events: none;
+      backdrop-filter: blur(4px);
+    }
+    .hud .title { color: var(--accent); font-weight: 600; margin-bottom: 6px; }
+    .hud .muted { color: var(--muted); }
+    .thumb {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      width: 250px;
+      height: 160px;
+      background: var(--panel);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .thumb canvas { width: 100%; height: 100%; }
+  </style>
+</head>
+<body>
+  <canvas id="main"></canvas>
+  <div class="hud" id="hud"></div>
+  <div class="thumb"><canvas id="bestThumb" width="250" height="160"></canvas></div>
+
+  <script>
+    "use strict";
+
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const rand = (a, b) => a + Math.random() * (b - a);
+    const randInt = (a, b) => Math.floor(rand(a, b + 1));
+    const chance = p => Math.random() < p;
+
+    class Node {
+      constructor(x, y, mass = 1, pinned = false) {
+        this.x = x;
+        this.y = y;
+        this.prevX = x;
+        this.prevY = y;
+        this.mass = mass;
+        this.pinned = pinned;
+      }
+      clone() {
+        const n = new Node(this.x, this.y, this.mass, this.pinned);
+        n.prevX = this.prevX;
+        n.prevY = this.prevY;
+        return n;
+      }
+    }
+
+    const SpringType = {
+      STRUCTURAL: "STRUCTURAL",
+      ROD: "ROD",
+      MUSCLE: "MUSCLE"
+    };
+
+    class Spring {
+      constructor(nodeA, nodeB, restLength, stiffness, damping, type = SpringType.STRUCTURAL, muscle = null) {
+        this.nodeA = nodeA;
+        this.nodeB = nodeB;
+        this.baseLength = restLength;
+        this.restLength = restLength;
+        this.stiffness = stiffness;
+        this.damping = damping;
+        this.type = type;
+        this.muscle = muscle;
+      }
+      updateMuscle(t) {
+        if (this.type !== SpringType.MUSCLE || !this.muscle) {
+          this.restLength = this.baseLength;
+          return;
+        }
+        const { amplitude, frequency, phase } = this.muscle;
+        this.restLength = Math.max(6, this.baseLength + amplitude * Math.sin(t * frequency + phase));
+      }
+    }
+
+    class Genome {
+      constructor(nodes = [], springs = []) {
+        this.nodes = nodes;
+        this.springs = springs;
+      }
+      serialize() { return JSON.stringify({ nodes: this.nodes, springs: this.springs }); }
+      static deserialize(str) {
+        const data = JSON.parse(str);
+        return new Genome(data.nodes, data.springs);
+      }
+      clone() {
+        return new Genome(
+          this.nodes.map(n => ({ ...n })),
+          this.springs.map(s => ({ ...s, muscle: s.muscle ? { ...s.muscle } : null }))
+        );
+      }
+      static random() {
+        const nCount = randInt(6, 12);
+        const nodes = [];
+        for (let i = 0; i < nCount; i++) {
+          nodes.push({ x: rand(-45, 45), y: rand(-80, -10), mass: rand(0.6, 1.5), pinned: false });
+        }
+        const springs = [];
+        const edgeSet = new Set();
+        const addEdge = (a, b, type = SpringType.STRUCTURAL) => {
+          if (a === b) return;
+          const i = Math.min(a, b), j = Math.max(a, b), key = `${i}-${j}`;
+          if (edgeSet.has(key)) return;
+          edgeSet.add(key);
+          const dx = nodes[a].x - nodes[b].x;
+          const dy = nodes[a].y - nodes[b].y;
+          const len = Math.hypot(dx, dy);
+          let spring = {
+            a, b,
+            type,
+            baseLength: clamp(len, 8, 120),
+            stiffness: type === SpringType.ROD ? rand(0.85, 0.98) : rand(0.35, 0.9),
+            damping: rand(0.01, 0.08),
+            muscle: null
+          };
+          if (type === SpringType.MUSCLE) {
+            spring.muscle = {
+              amplitude: rand(3, 16),
+              frequency: rand(2.2, 7.5),
+              phase: rand(0, Math.PI * 2)
+            };
+          }
+          springs.push(spring);
+        };
+
+        for (let i = 0; i < nCount - 1; i++) addEdge(i, i + 1, chance(0.25) ? SpringType.ROD : SpringType.STRUCTURAL);
+        for (let i = 0; i < nCount; i++) {
+          const links = randInt(1, 3);
+          for (let k = 0; k < links; k++) {
+            const j = randInt(0, nCount - 1);
+            addEdge(i, j, chance(0.2) ? SpringType.MUSCLE : (chance(0.2) ? SpringType.ROD : SpringType.STRUCTURAL));
+          }
+        }
+        if (!springs.some(s => s.type === SpringType.MUSCLE) && springs.length > 0) {
+          const idx = randInt(0, springs.length - 1);
+          springs[idx].type = SpringType.MUSCLE;
+          springs[idx].muscle = { amplitude: rand(5, 15), frequency: rand(2, 6), phase: rand(0, Math.PI * 2) };
+        }
+        return new Genome(nodes, springs);
+      }
+    }
+
+    class Creature {
+      constructor(genome, spawnX, groundY) {
+        this.genome = genome;
+        this.nodes = genome.nodes.map(n => new Node(spawnX + n.x, groundY + n.y, n.mass, n.pinned));
+        this.springs = genome.springs.map(s => new Spring(
+          this.nodes[s.a], this.nodes[s.b], s.baseLength, s.stiffness, s.damping, s.type,
+          s.muscle ? { ...s.muscle } : null
+        ));
+        this.startCOM = this.getCenterOfMass().x;
+      }
+      getCenterOfMass() {
+        let mx = 0, my = 0, msum = 0;
+        for (const n of this.nodes) {
+          mx += n.x * n.mass;
+          my += n.y * n.mass;
+          msum += n.mass;
+        }
+        return { x: mx / msum, y: my / msum };
+      }
+      fitness() {
+        return this.getCenterOfMass().x - this.startCOM;
+      }
+    }
+
+    class PhysicsWorld {
+      constructor() {
+        this.gravity = 900;
+        this.groundY = 520;
+        this.airDrag = 0.996;
+        this.groundFriction = 0.78;
+        this.constraintIterations = 10;
+        this.maxSpeed = 900;
+      }
+
+      step(creature, dt, t) {
+        for (const s of creature.springs) s.updateMuscle(t);
+
+        for (const n of creature.nodes) {
+          if (n.pinned) continue;
+          const vx = clamp((n.x - n.prevX) * this.airDrag, -this.maxSpeed * dt, this.maxSpeed * dt);
+          const vy = clamp((n.y - n.prevY) * this.airDrag, -this.maxSpeed * dt, this.maxSpeed * dt);
+          n.prevX = n.x;
+          n.prevY = n.y;
+          n.x += vx;
+          n.y += vy + this.gravity * dt * dt;
+        }
+
+        for (let i = 0; i < this.constraintIterations; i++) {
+          this.solveSprings(creature.springs);
+          this.solveCollisions(creature.nodes);
+        }
+      }
+
+      solveSprings(springs) {
+        for (const s of springs) {
+          const a = s.nodeA, b = s.nodeB;
+          let dx = b.x - a.x;
+          let dy = b.y - a.y;
+          const dist = Math.hypot(dx, dy) || 0.0001;
+          const diff = (dist - s.restLength) / dist;
+          const stiffness = s.type === SpringType.ROD ? Math.max(s.stiffness, 0.9) : s.stiffness;
+          const corr = diff * 0.5 * stiffness;
+
+          let dax = dx * corr;
+          let day = dy * corr;
+          if (!a.pinned) {
+            a.x += dax;
+            a.y += day;
+          }
+          if (!b.pinned) {
+            b.x -= dax;
+            b.y -= day;
+          }
+
+          const avx = a.x - a.prevX;
+          const avy = a.y - a.prevY;
+          const bvx = b.x - b.prevX;
+          const bvy = b.y - b.prevY;
+          const rel = (bvx - avx) * (dx / dist) + (bvy - avy) * (dy / dist);
+          const damp = rel * s.damping;
+          if (!a.pinned) {
+            a.prevX += (dx / dist) * damp * 0.5;
+            a.prevY += (dy / dist) * damp * 0.5;
+          }
+          if (!b.pinned) {
+            b.prevX -= (dx / dist) * damp * 0.5;
+            b.prevY -= (dy / dist) * damp * 0.5;
+          }
+        }
+      }
+
+      solveCollisions(nodes) {
+        for (const n of nodes) {
+          if (n.y > this.groundY) {
+            n.y = this.groundY;
+            const vx = (n.x - n.prevX) * this.groundFriction;
+            n.prevY = n.y;
+            n.prevX = n.x - vx;
+          }
+        }
+      }
+    }
+
+    class EvolutionSystem {
+      constructor(world) {
+        this.world = world;
+        this.populationSize = 20;
+        this.population = [];
+        this.currentIndex = 0;
+        this.generation = 1;
+        this.evalTime = 10;
+        this.elapsed = 0;
+        this.currentCreature = null;
+        this.records = [];
+        this.bestGenome = null;
+        this.bestFitnessEver = -Infinity;
+        this.viewBest = false;
+        this.reset();
+      }
+
+      reset() {
+        this.population = Array.from({ length: this.populationSize }, () => Genome.random());
+        this.currentIndex = 0;
+        this.generation = 1;
+        this.records = [];
+        this.elapsed = 0;
+        this.bestGenome = this.population[0].clone();
+        this.bestFitnessEver = -Infinity;
+        this.spawnCurrent();
+      }
+
+      spawnCurrent() {
+        const genome = this.viewBest && this.bestGenome ? this.bestGenome : this.population[this.currentIndex];
+        this.currentCreature = new Creature(genome.clone(), 180, this.world.groundY - 5);
+        this.elapsed = 0;
+      }
+
+      update(dt, simTime) {
+        if (!this.currentCreature) this.spawnCurrent();
+        const subSteps = 2;
+        const stepDt = dt / subSteps;
+        for (let i = 0; i < subSteps; i++) {
+          this.world.step(this.currentCreature, stepDt, simTime + i * stepDt);
+        }
+
+        if (this.viewBest) return;
+
+        this.elapsed += dt;
+        if (this.elapsed >= this.evalTime) {
+          const fit = this.currentCreature.fitness();
+          this.records[this.currentIndex] = fit;
+          if (fit > this.bestFitnessEver) {
+            this.bestFitnessEver = fit;
+            this.bestGenome = this.population[this.currentIndex].clone();
+          }
+          this.currentIndex++;
+          if (this.currentIndex >= this.populationSize) {
+            this.nextGeneration();
+            this.currentIndex = 0;
+          }
+          this.spawnCurrent();
+        }
+      }
+
+      nextGeneration() {
+        const ranked = this.population
+          .map((g, i) => ({ genome: g, fitness: this.records[i] ?? -9999 }))
+          .sort((a, b) => b.fitness - a.fitness);
+
+        const eliteCount = 4;
+        const elites = ranked.slice(0, eliteCount).map(r => r.genome.clone());
+        const newPop = [...elites.map(e => e.clone())];
+
+        while (newPop.length < this.populationSize) {
+          const parent = elites[randInt(0, elites.length - 1)].clone();
+          newPop.push(this.mutateGenome(parent));
+        }
+
+        this.population = newPop;
+        this.records = [];
+        this.generation++;
+      }
+
+      mutateGenome(genome) {
+        const g = genome.clone();
+        const ops = [
+          () => this.mAddNode(g),
+          () => this.mRemoveNode(g),
+          () => this.mMoveNode(g),
+          () => this.mAddSpring(g),
+          () => this.mRemoveSpring(g),
+          () => this.mStiffness(g),
+          () => this.mAmp(g),
+          () => this.mFreq(g),
+          () => this.mPhase(g)
+        ];
+        const count = randInt(1, 3);
+        for (let i = 0; i < count; i++) ops[randInt(0, ops.length - 1)]();
+        if (!g.springs.some(s => s.type === SpringType.MUSCLE) && g.springs.length > 0) {
+          const s = g.springs[randInt(0, g.springs.length - 1)];
+          s.type = SpringType.MUSCLE;
+          s.muscle = { amplitude: rand(4, 12), frequency: rand(2, 6), phase: rand(0, Math.PI * 2) };
+        }
+        return g;
+      }
+
+      mAddNode(g) {
+        if (g.nodes.length >= 40) return;
+        g.nodes.push({ x: rand(-55, 55), y: rand(-95, -8), mass: rand(0.7, 1.4), pinned: false });
+        const idx = g.nodes.length - 1;
+        const links = randInt(2, 4);
+        for (let i = 0; i < links; i++) {
+          const j = randInt(0, idx - 1);
+          this.addSpringIfMissing(g, idx, j, chance(0.25) ? SpringType.MUSCLE : SpringType.STRUCTURAL);
+        }
+      }
+      mRemoveNode(g) {
+        if (g.nodes.length <= 4) return;
+        const idx = randInt(0, g.nodes.length - 1);
+        g.nodes.splice(idx, 1);
+        g.springs = g.springs.filter(s => s.a !== idx && s.b !== idx).map(s => ({
+          ...s,
+          a: s.a > idx ? s.a - 1 : s.a,
+          b: s.b > idx ? s.b - 1 : s.b
+        }));
+      }
+      mMoveNode(g) {
+        const n = g.nodes[randInt(0, g.nodes.length - 1)];
+        n.x += rand(-10, 10);
+        n.y += rand(-10, 10);
+      }
+      mAddSpring(g) {
+        if (g.springs.length >= 80) return;
+        const a = randInt(0, g.nodes.length - 1);
+        const b = randInt(0, g.nodes.length - 1);
+        this.addSpringIfMissing(g, a, b, chance(0.3) ? SpringType.MUSCLE : (chance(0.2) ? SpringType.ROD : SpringType.STRUCTURAL));
+      }
+      mRemoveSpring(g) {
+        if (g.springs.length <= 4) return;
+        g.springs.splice(randInt(0, g.springs.length - 1), 1);
+      }
+      mStiffness(g) {
+        if (!g.springs.length) return;
+        const s = g.springs[randInt(0, g.springs.length - 1)];
+        s.stiffness = clamp(s.stiffness + rand(-0.08, 0.08), 0.2, 0.98);
+      }
+      mAmp(g) {
+        const m = g.springs.filter(s => s.type === SpringType.MUSCLE && s.muscle);
+        if (!m.length) return;
+        const s = m[randInt(0, m.length - 1)];
+        s.muscle.amplitude = clamp(s.muscle.amplitude + rand(-2, 2), 0, 24);
+      }
+      mFreq(g) {
+        const m = g.springs.filter(s => s.type === SpringType.MUSCLE && s.muscle);
+        if (!m.length) return;
+        const s = m[randInt(0, m.length - 1)];
+        s.muscle.frequency = clamp(s.muscle.frequency + rand(-0.7, 0.7), 0.5, 12);
+      }
+      mPhase(g) {
+        const m = g.springs.filter(s => s.type === SpringType.MUSCLE && s.muscle);
+        if (!m.length) return;
+        const s = m[randInt(0, m.length - 1)];
+        s.muscle.phase += rand(-0.7, 0.7);
+      }
+
+      addSpringIfMissing(g, a, b, type) {
+        if (a === b) return;
+        const i = Math.min(a, b), j = Math.max(a, b);
+        if (g.springs.some(s => (Math.min(s.a, s.b) === i && Math.max(s.a, s.b) === j))) return;
+        const na = g.nodes[a], nb = g.nodes[b];
+        const len = clamp(Math.hypot(na.x - nb.x, na.y - nb.y), 8, 130);
+        g.springs.push({
+          a, b, type,
+          baseLength: len,
+          stiffness: type === SpringType.ROD ? rand(0.88, 0.98) : rand(0.3, 0.92),
+          damping: rand(0.01, 0.09),
+          muscle: type === SpringType.MUSCLE ? { amplitude: rand(3, 14), frequency: rand(1.5, 8), phase: rand(0, Math.PI * 2) } : null
+        });
+      }
+    }
+
+    class Renderer {
+      constructor(canvas, thumbCanvas, world) {
+        this.canvas = canvas;
+        this.ctx = canvas.getContext("2d");
+        this.thumb = thumbCanvas;
+        this.thumbCtx = thumbCanvas.getContext("2d");
+        this.world = world;
+        this.cameraX = 0;
+        this.resize();
+        window.addEventListener("resize", () => this.resize());
+      }
+      resize() {
+        this.canvas.width = window.innerWidth;
+        this.canvas.height = window.innerHeight;
+      }
+      draw(creature, bestGenome) {
+        const ctx = this.ctx;
+        const w = this.canvas.width, h = this.canvas.height;
+
+        ctx.fillStyle = "#0f111a";
+        ctx.fillRect(0, 0, w, h);
+
+        const com = creature.getCenterOfMass();
+        this.cameraX += (com.x - this.cameraX - w * 0.35) * 0.08;
+
+        ctx.save();
+        ctx.translate(-this.cameraX, 0);
+
+        ctx.strokeStyle = "#2f3550";
+        ctx.lineWidth = 2;
+        for (let x = -1000; x < 10000; x += 50) {
+          ctx.beginPath();
+          ctx.moveTo(x, this.world.groundY + 1);
+          ctx.lineTo(x + 25, this.world.groundY + 1);
+          ctx.stroke();
+        }
+
+        this.drawCreature(ctx, creature, 1);
+        ctx.restore();
+
+        this.drawBestThumbnail(bestGenome);
+      }
+
+      drawCreature(ctx, creature, alpha = 1) {
+        ctx.globalAlpha = alpha;
+        for (const s of creature.springs) {
+          if (s.type === SpringType.MUSCLE) ctx.strokeStyle = "#ff4f55";
+          else if (s.type === SpringType.ROD) ctx.strokeStyle = "#f2f2f2";
+          else ctx.strokeStyle = "#8b94aa";
+          ctx.lineWidth = s.type === SpringType.ROD ? 2.5 : 1.8;
+          ctx.beginPath();
+          ctx.moveTo(s.nodeA.x, s.nodeA.y);
+          ctx.lineTo(s.nodeB.x, s.nodeB.y);
+          ctx.stroke();
+        }
+
+        for (const n of creature.nodes) {
+          ctx.beginPath();
+          ctx.fillStyle = "#7fd1ff";
+          ctx.arc(n.x, n.y, 3.2, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+      }
+
+      drawBestThumbnail(bestGenome) {
+        const ctx = this.thumbCtx;
+        const w = this.thumb.width, h = this.thumb.height;
+        ctx.fillStyle = "#111525";
+        ctx.fillRect(0, 0, w, h);
+        ctx.fillStyle = "#d6ddff";
+        ctx.font = "12px sans-serif";
+        ctx.fillText("Best Genome", 8, 14);
+        if (!bestGenome) return;
+
+        const xs = bestGenome.nodes.map(n => n.x);
+        const ys = bestGenome.nodes.map(n => n.y);
+        const minX = Math.min(...xs), maxX = Math.max(...xs);
+        const minY = Math.min(...ys), maxY = Math.max(...ys);
+        const sx = (w - 40) / Math.max(1, (maxX - minX));
+        const sy = (h - 40) / Math.max(1, (maxY - minY));
+        const s = Math.min(sx, sy);
+        const ox = w * 0.5 - ((minX + maxX) * 0.5) * s;
+        const oy = h * 0.6 - ((minY + maxY) * 0.5) * s;
+
+        for (const sp of bestGenome.springs) {
+          const a = bestGenome.nodes[sp.a], b = bestGenome.nodes[sp.b];
+          if (!a || !b) continue;
+          ctx.strokeStyle = sp.type === SpringType.MUSCLE ? "#ff4f55" : (sp.type === SpringType.ROD ? "#fff" : "#8b94aa");
+          ctx.beginPath();
+          ctx.moveTo(a.x * s + ox, a.y * s + oy);
+          ctx.lineTo(b.x * s + ox, b.y * s + oy);
+          ctx.stroke();
+        }
+        for (const n of bestGenome.nodes) {
+          ctx.fillStyle = "#7fd1ff";
+          ctx.beginPath();
+          ctx.arc(n.x * s + ox, n.y * s + oy, 2.2, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
+
+    class InputController {
+      constructor(evo) {
+        this.paused = false;
+        window.addEventListener("keydown", e => {
+          if (e.code === "Space") {
+            e.preventDefault();
+            this.paused = !this.paused;
+          } else if (e.key.toLowerCase() === "r") {
+            evo.viewBest = false;
+            evo.reset();
+          } else if (e.key.toLowerCase() === "b") {
+            evo.viewBest = !evo.viewBest;
+            evo.spawnCurrent();
+          } else if (e.key.toLowerCase() === "n") {
+            evo.viewBest = false;
+            evo.currentIndex = (evo.currentIndex + 1) % evo.populationSize;
+            evo.spawnCurrent();
+          }
+        });
+      }
+    }
+
+    function spawnRandomCreature(world) {
+      return new Creature(Genome.random(), 180, world.groundY - 5);
+    }
+
+    const canvas = document.getElementById("main");
+    const thumb = document.getElementById("bestThumb");
+    const hud = document.getElementById("hud");
+
+    const world = new PhysicsWorld();
+    const evo = new EvolutionSystem(world);
+    const renderer = new Renderer(canvas, thumb, world);
+    const input = new InputController(evo);
+
+    window.spawnRandomCreature = () => spawnRandomCreature(world);
+    window.currentGenomeJSON = () => evo.population[evo.currentIndex].serialize();
+
+    let last = performance.now();
+    let simTime = 0;
+
+    function frame(now) {
+      const dt = clamp((now - last) / 1000, 0.001, 0.033);
+      last = now;
+      if (!input.paused) {
+        evo.update(dt, simTime);
+        simTime += dt;
+      }
+
+      renderer.draw(evo.currentCreature, evo.bestGenome);
+
+      const fit = evo.currentCreature ? evo.currentCreature.fitness() : 0;
+      hud.innerHTML = `
+        <div class="title">Evolutionary Soft-Body Simulator</div>
+        <div>Generation: <b>${evo.generation}</b></div>
+        <div>Creature: <b>${evo.currentIndex + 1}/${evo.populationSize}</b></div>
+        <div>Current Distance: <b>${fit.toFixed(2)}</b></div>
+        <div>Best Distance: <b>${isFinite(evo.bestFitnessEver) ? evo.bestFitnessEver.toFixed(2) : "0.00"}</b></div>
+        <div class="muted">Nodes: ${evo.currentCreature.nodes.length} | Springs: ${evo.currentCreature.springs.length}</div>
+        <div class="muted">SPACE pause • R restart • B best view • N next creature</div>
+      `;
+
+      requestAnimationFrame(frame);
+    }
+
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>
